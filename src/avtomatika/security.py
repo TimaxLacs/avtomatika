@@ -75,6 +75,8 @@ def worker_auth_middleware_factory(
                 # Attach the parsed data to the request so the handler doesn't need to re-parse
                 if request.path.endswith("/register"):
                     request["worker_registration_data"] = data
+                elif request.path.endswith("/tasks/result"):
+                    request["task_result_data"] = data
             except Exception:
                 return web.json_response({"error": "Invalid JSON body"}, status=400)
 

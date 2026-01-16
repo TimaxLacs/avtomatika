@@ -376,16 +376,20 @@ class OrchestratorEngine:
     async def _task_result_handler(self, request: web.Request) -> web.Response:
         import logging
 
-        try:
-            data = await request.json()
-            job_id = data.get("job_id")
-            task_id = data.get("task_id")
-            result = data.get("result", {})
-            result_status = result.get("status", "success")
-            error_message = result.get("error")
-            payload_worker_id = data.get("worker_id")
-        except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        # Use pre-parsed data from middleware if available, otherwise read the body
+        data = request.get("task_result_data")
+        if data is None:
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        job_id = data.get("job_id")
+        task_id = data.get("task_id")
+        result = data.get("result", {})
+        result_status = result.get("status", "success")
+        error_message = result.get("error")
+        payload_worker_id = data.get("worker_id")
 
         # Security check: Ensure the worker_id from the payload matches the authenticated worker
         authenticated_worker_id = request.get("worker_id")
