@@ -14,6 +14,7 @@ This document serves as a comprehensive guide for developers looking to build pi
   - [Delegating Tasks to Workers (dispatch_task)](#delegating-tasks-to-workers-dispatch_task)
   - [Parallel Execution and Aggregation (Fan-out/Fan-in)](#parallel-execution-and-aggregation-fan-outfan-in)
   - [Dependency Injection (DataStore)](#dependency-injection-datastore)
+  - [Native Scheduler](#native-scheduler)
 - [Production Configuration](#production-configuration)
   - [Fault Tolerance](#fault-tolerance)
   - [Storage Backend](#storage-backend)
@@ -28,7 +29,17 @@ The project is based on a simple yet powerful architectural pattern that separat
 
 *   **Orchestrator (OrchestratorEngine)** — The Director. It manages the entire process from start to finish, tracks state, handles errors, and decides what should happen next. It does not perform business tasks itself.
 *   **Blueprints (Blueprint)** — The Script. Each blueprint is a detailed plan (a state machine) for a specific business process. It describes the steps (states) and the rules for transitioning between them.
-*   **Workers (Worker)** — The Team of Specialists. These are independent, specialized executors. Each worker knows how to perform a specific set of tasks (e.g., "process video," "send email") and reports back to the Orchestrator.## Installation
+*   **Workers (Worker)** — The Team of Specialists. These are independent, specialized executors. Each worker knows how to perform a specific set of tasks (e.g., "process video," "send email") and reports back to the Orchestrator.
+
+## Ecosystem
+
+Avtomatika is part of a larger ecosystem:
+
+*   **[Avtomatika Worker SDK](https://github.com/avtomatika-ai/avtomatika-worker)**: The official Python SDK for building workers that connect to this engine.
+*   **[RCA Protocol](https://github.com/avtomatika-ai/rca)**: The architectural specification and manifesto behind the system.
+*   **[Full Example](https://github.com/avtomatika-ai/avtomatika-full-example)**: A complete reference project demonstrating the engine and workers in action.
+
+## Installation
 
 *   **Install the core engine only:**
     ```bash
@@ -282,11 +293,51 @@ async def cache_handler(data_stores):
     user_data = await data_stores.cache.get("user:123")
     print(f"User from cache: {user_data}")
 ```
+
+### 5. Native Scheduler
+
+Avtomatika includes a built-in distributed scheduler. It allows you to trigger blueprints periodically (interval, daily, weekly, monthly) without external tools like cron.
+
+*   **Configuration:** Defined in `schedules.toml`.
+*   **Timezone Aware:** Supports global timezone configuration (e.g., `TZ="Europe/Moscow"`).
+*   **Distributed Locking:** Safe to run with multiple orchestrator instances; jobs are guaranteed to run only once per interval using distributed locks (Redis/Memory).
+
+```toml
+# schedules.toml example
+[nightly_backup]
+blueprint = "backup_flow"
+daily_at = "02:00"
+```
+
 ## Production Configuration
 
 The orchestrator's behavior can be configured through environment variables. Additionally, any configuration parameter loaded from environment variables can be programmatically overridden in your application code after the `Config` object has been initialized. This provides flexibility for different deployment and testing scenarios.
 
 **Important:** The system employs **strict validation** for configuration files (`clients.toml`, `workers.toml`) at startup. If a configuration file is invalid (e.g., malformed TOML, missing required fields), the application will **fail fast** and exit with an error, rather than starting in a partially broken state. This ensures the security and integrity of the deployment.
+
+### Configuration Files
+
+To manage access and worker settings securely, Avtomatika uses TOML configuration files.
+
+-   **`clients.toml`**: Defines API clients, their tokens, plans, and quotas.
+    ```toml
+    [client_premium]
+    token = "secret-token-123"
+    plan = "premium"
+    ```
+-   **`workers.toml`**: Defines individual tokens for workers to enhance security.
+    ```toml
+    [gpu-worker-01]
+    token = "worker-secret-456"
+    ```
+-   **`schedules.toml`**: Defines periodic tasks (CRON-like) for the native scheduler.
+    ```toml
+    [nightly_backup]
+    blueprint = "backup_flow"
+    daily_at = "02:00"
+    ```
+
+For detailed specifications and examples, please refer to the [**Configuration Guide**](docs/configuration.md).
 
 ### Fault Tolerance
 
@@ -296,18 +347,25 @@ The orchestrator has built-in mechanisms for handling failures based on the `err
 *   **PERMANENT_ERROR**: A permanent error (e.g., a corrupted file). The task will be immediately sent to quarantine for manual investigation.
 *   **INVALID_INPUT_ERROR**: An error in the input data. The entire pipeline (Job) will be immediately moved to the failed state.
 
+### Concurrency & Performance
+
+To prevent system overload during high traffic, the Orchestrator implements a backpressure mechanism for its internal job processing logic.
+
+*   **`EXECUTOR_MAX_CONCURRENT_JOBS`**: Limits the number of job handlers running simultaneously within the Orchestrator process (default: `100`). If this limit is reached, new jobs remain in the Redis queue until a slot becomes available. This ensures the event loop remains responsive even with a massive backlog of pending jobs.
+
 ### High Availability & Distributed Locking
 
 The architecture supports horizontal scaling. Multiple Orchestrator instances can run behind a load balancer.
 
 *   **Stateless API:** The API is stateless; all state is persisted in Redis.
+*   **Instance Identity:** Each instance should have a unique `INSTANCE_ID` (defaults to hostname) for correct handling of Redis Streams consumer groups.
 *   **Distributed Locking:** Background processes (`Watcher`, `ReputationCalculator`) use distributed locks (via Redis `SET NX`) to coordinate and prevent race conditions when multiple instances are active.
 
 ### Storage Backend
 
 By default, the engine uses in-memory storage. For production, you must configure persistent storage via environment variables.
 
-*   **Redis (StorageBackend)**: For storing current job states.
+*   **Redis (StorageBackend)**: For storing current job states (serialized with `msgpack`) and managing task queues (using Redis Streams with consumer groups).
     *   Install:
         ```bash
         pip install "avtomatika[redis]"
@@ -372,11 +430,21 @@ To run the `avtomatika` test suite:
 pytest avtomatika/tests/
 ```
 
+### Interactive API Documentation
+
+Avtomatika provides a built-in interactive API documentation page (similar to Swagger UI) that is automatically generated based on your registered blueprints.
+
+*   **Endpoint:** `/_public/docs`
+*   **Features:**
+    *   **List of all system endpoints:** Detailed documentation for Public, Protected, and Worker API groups.
+    *   **Dynamic Blueprint Documentation:** Automatically generates and lists documentation for all blueprints registered in the engine, including their specific API endpoints.
+    *   **Interactive Testing:** Allows you to test API calls directly from the browser. You can provide authentication tokens, parameters, and request bodies to see real server responses.
+
 ## Detailed Documentation
 
-For a deeper dive into the system, please refer to the following documents in the `docs/` directory:
+For a deeper dive into the system, please refer to the following documents:
 
-- [**Architecture Guide**](docs/architecture.md): A detailed overview of the system components and their interactions.
-- [**API Reference**](docs/api_reference.md): Full specification of the HTTP API.
-- [**Deployment Guide**](docs/deployment.md): Instructions for deploying with Gunicorn/Uvicorn and NGINX.
-- [**Cookbook**](docs/cookbook/README.md): Examples and best practices for creating blueprints.
+- [**Architecture Guide**](https://github.com/avtomatika-ai/avtomatika/blob/main/docs/architecture.md): A detailed overview of the system components and their interactions.
+- [**API Reference**](https://github.com/avtomatika-ai/avtomatika/blob/main/docs/api_reference.md): Full specification of the HTTP API.
+- [**Deployment Guide**](https://github.com/avtomatika-ai/avtomatika/blob/main/docs/deployment.md): Instructions for deploying with Gunicorn/Uvicorn and NGINX.
+- [**Cookbook**](https://github.com/avtomatika-ai/avtomatika/blob/main/docs/cookbook/README.md): Examples and best practices for creating blueprints.

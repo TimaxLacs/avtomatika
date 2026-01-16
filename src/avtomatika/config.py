@@ -1,4 +1,5 @@
 from os import getenv
+from socket import gethostname
 
 
 class Config:
@@ -7,6 +8,9 @@ class Config:
     """
 
     def __init__(self):
+        # Instance identity
+        self.INSTANCE_ID: str = getenv("INSTANCE_ID", gethostname())
+
         # Redis settings
         self.REDIS_HOST: str = getenv("REDIS_HOST", "")
         self.REDIS_PORT: int = int(getenv("REDIS_PORT", 6379))
@@ -45,6 +49,9 @@ class Config:
         self.WATCHER_INTERVAL_SECONDS: int = int(
             getenv("WATCHER_INTERVAL_SECONDS", 20),
         )
+        self.EXECUTOR_MAX_CONCURRENT_JOBS: int = int(
+            getenv("EXECUTOR_MAX_CONCURRENT_JOBS", 100),
+        )
 
         # History storage settings
         self.HISTORY_DATABASE_URI: str = getenv("HISTORY_DATABASE_URI", "")
@@ -55,3 +62,7 @@ class Config:
         # External config files
         self.WORKERS_CONFIG_PATH: str = getenv("WORKERS_CONFIG_PATH", "")
         self.CLIENTS_CONFIG_PATH: str = getenv("CLIENTS_CONFIG_PATH", "")
+        self.SCHEDULES_CONFIG_PATH: str = getenv("SCHEDULES_CONFIG_PATH", "")
+
+        # Timezone settings
+        self.TZ: str = getenv("TZ", "UTC")
