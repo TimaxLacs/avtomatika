@@ -96,6 +96,55 @@ config.RATE_LIMITING_ENABLED = False  # Отключаем для локальн
 
 ---
 
+## 2026-01-12: Merge с upstream (origin/main)
+
+### Действие
+Выполнен merge с оригинальным репозиторием для получения обновлений:
+- Beta 6: Native Distributed Scheduler and Global Timezone Support
+- Beta 5: Reliability, Redis Streams, and Concurrency Control
+- Beta 4: Interactive API Docs and Configuration Specs
+
+### Конфликты и разрешение
+
+#### `src/avtomatika/engine.py`
+
+**Конфликт:** Различия в `_task_result_handler`:
+- Локальная версия: использовала pre-parsed data из middleware
+- Upstream версия: использовала константы `TASK_STATUS_SUCCESS` и `json_response` helper
+
+**Решение:** Объединены оба подхода:
+- Сохранена логика с pre-parsed data (исправление бага)
+- Использованы константы и helper-функции из upstream
+
+**Итоговый код:**
+```python
+async def _task_result_handler(self, request: web.Request) -> web.Response:
+    import logging
+
+    # Use pre-parsed data from middleware if available, otherwise read the body
+    data = request.get("task_result_data")
+    if data is None:
+        try:
+            data = await request.json(loads=loads)
+        except Exception:
+            return json_response({"error": "Invalid JSON body"}, status=400)
+
+    job_id = data.get("job_id")
+    task_id = data.get("task_id")
+    result = data.get("result", {})
+    result_status = result.get("status", TASK_STATUS_SUCCESS)  # Используем константу
+    error_message = result.get("error")
+    payload_worker_id = data.get("worker_id")
+```
+
+### Новые файлы из upstream
+- `docs/` — документация API, архитектура, конфигурация
+- `src/avtomatika/constants.py` — константы для статусов
+- `src/avtomatika/scheduler.py` — планировщик задач
+- `src/avtomatika/scheduler_config_loader.py` — загрузка конфигурации планировщика
+
+---
+
 ## Созданные файлы для локального тестирования
 
 ### `local_test/orchestrator_server.py`
