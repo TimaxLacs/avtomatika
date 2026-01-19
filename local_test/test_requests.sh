@@ -1,58 +1,72 @@
 #!/bin/bash
-# Скрипт для тестовых запросов к Orchestrator
-# Использование: ./local_test/test_requests.sh
+# Тестовые запросы к оркестратору
 
-BASE_URL="http://localhost:8080"
-TOKEN="test-client-token"
+BASE_URL="http://localhost:8000"
+CLIENT_TOKEN="test-client-token"
 
-echo "========================================"
-echo "Testing Avtomatika Orchestrator"
-echo "========================================"
+echo "=========================================="
+echo "Testing Orchestrator API"
+echo "=========================================="
 echo ""
 
-# 1. Проверка статуса
-echo "1. Health check..."
-curl -s "$BASE_URL/_public/status" | python3 -m json.tool
+# 1. Создаём job
+echo "1. Creating a new job..."
+JOB_RESPONSE=$(curl -s -X POST "$BASE_URL/jobs" \
+    -H "Authorization: Bearer $CLIENT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "blueprint": "test_workflow",
+        "data": {
+            "input": "Hello, World!"
+        }
+    }')
+
+echo "Response: $JOB_RESPONSE"
 echo ""
-
-# 2. Создание job'а
-echo "2. Creating a job..."
-RESPONSE=$(curl -s -X POST "$BASE_URL/api/v1/jobs/test" \
-  -H "Content-Type: application/json" \
-  -H "X-Avtomatika-Token: $TOKEN" \
-  -d '{"message": "Hello World", "multiply": 3}')
-
-echo "$RESPONSE" | python3 -m json.tool
 
 # Извлекаем job_id
-JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('job_id', ''))")
+JOB_ID=$(echo $JOB_RESPONSE | grep -o '"job_id":"[^"]*"' | cut -d'"' -f4)
 
 if [ -z "$JOB_ID" ]; then
-  echo "ERROR: Could not get job_id"
-  exit 1
+    echo "ERROR: Failed to create job"
+    exit 1
 fi
 
-echo ""
-echo "Job ID: $JOB_ID"
-echo ""
-
-# 3. Ждём немного
-echo "3. Waiting 3 seconds for processing..."
-sleep 3
-
-# 4. Проверяем статус job'а
-echo ""
-echo "4. Checking job status..."
-curl -s "$BASE_URL/api/v1/jobs/$JOB_ID" \
-  -H "X-Avtomatika-Token: $TOKEN" | python3 -m json.tool
+echo "Created job: $JOB_ID"
 echo ""
 
-# 5. Список воркеров
-echo "5. Listing workers..."
-curl -s "$BASE_URL/api/v1/workers" \
-  -H "X-Avtomatika-Token: $TOKEN" | python3 -m json.tool
+# 2. Проверяем статус job
+echo "2. Checking job status..."
+sleep 1
+
+STATUS_RESPONSE=$(curl -s -X GET "$BASE_URL/jobs/$JOB_ID" \
+    -H "Authorization: Bearer $CLIENT_TOKEN")
+
+echo "Job status: $STATUS_RESPONSE"
 echo ""
 
-echo "========================================"
+# 3. Ждём пока воркер обработает задачу
+echo "3. Waiting for worker to process the task..."
+echo "   (Make sure worker_client.py is running in another terminal)"
+echo ""
+
+for i in {1..10}; do
+    sleep 2
+    STATUS_RESPONSE=$(curl -s -X GET "$BASE_URL/jobs/$JOB_ID" \
+        -H "Authorization: Bearer $CLIENT_TOKEN")
+    
+    STATE=$(echo $STATUS_RESPONSE | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+    echo "   Attempt $i: state = $STATE"
+    
+    if [ "$STATE" == "completed" ] || [ "$STATE" == "failed" ]; then
+        echo ""
+        echo "Final result:"
+        echo $STATUS_RESPONSE | python3 -m json.tool 2>/dev/null || echo $STATUS_RESPONSE
+        break
+    fi
+done
+
+echo ""
+echo "=========================================="
 echo "Test completed!"
-echo "========================================"
+echo "=========================================="

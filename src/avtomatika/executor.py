@@ -44,9 +44,9 @@ except ImportError:
         def extract(*args, **kwargs):
             return None
 
-    trace = NoOpTracer()
+    tracer = NoOpTracer()
     inject = NoOpPropagate().inject
-    TraceContextTextMapPropagator = NoOpTraceContextTextMapPropagator()  # Instantiate the class
+    TraceContextTextMapPropagator = NoOpTraceContextTextMapPropagator  # Keep as class for consistency
 
 from .context import ActionFactory
 from .data_types import ClientConfig, JobContext
@@ -92,16 +92,18 @@ class JobExecutor:
                 logger.warning(f"Job {job_id} is already in a terminal state '{job_state['status']}', skipping.")
                 return
 
-            # Ensure retry_count is initialized.
-            if "retry_count" not in job_state:
-                job_state["retry_count"] = 0
+            # Ensure retry_count is initialized and is an integer.
+            retry_count = job_state.get("retry_count", 0)
+            if not isinstance(retry_count, int):
+                retry_count = int(retry_count) if retry_count else 0
+            job_state["retry_count"] = retry_count
 
             await self.history_storage.log_job_event(
                 {
                     "job_id": job_id,
                     "state": job_state.get("current_state"),
                     "event_type": "state_started",
-                    "attempt_number": job_state.get("retry_count", 0) + 1,
+                    "attempt_number": retry_count + 1,
                     "context_snapshot": job_state,
                 },
             )
@@ -290,8 +292,10 @@ class JobExecutor:
 
             now = monotonic()
             # Safely get timeout, falling back to the global config if not provided in the task.
-            # This prevents TypeErrors if 'timeout_seconds' is missing.
+            # This prevents TypeErrors if 'timeout_seconds' is missing or wrong type.
             timeout_seconds = task_info.get("timeout_seconds") or self.engine.config.WORKER_TIMEOUT_SECONDS
+            if not isinstance(timeout_seconds, (int, float)):
+                timeout_seconds = int(timeout_seconds) if timeout_seconds else self.engine.config.WORKER_TIMEOUT_SECONDS
             timeout_at = now + timeout_seconds
 
             # Set status to waiting and add to watch list *before* dispatching

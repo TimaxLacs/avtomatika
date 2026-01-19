@@ -1,35 +1,18 @@
 from asyncio import Task, create_task, gather, get_running_loop, wait_for
 from asyncio import TimeoutError as AsyncTimeoutError
 from logging import getLogger
-from typing import Any, Callable
+from typing import Callable, Dict
 from uuid import uuid4
 
 from aiohttp import ClientSession, WSMsgType, web
 from aiohttp.web import AppKey
 from aioprometheus import render
-from orjson import OPT_INDENT_2, dumps, loads
 
 from . import metrics
 from .blueprint import StateMachineBlueprint
 from .client_config_loader import load_client_configs_to_redis
 from .compression import compression_middleware
 from .config import Config
-from .constants import (
-    ERROR_CODE_INVALID_INPUT,
-    ERROR_CODE_PERMANENT,
-    ERROR_CODE_TRANSIENT,
-    JOB_STATUS_CANCELLED,
-    JOB_STATUS_FAILED,
-    JOB_STATUS_PENDING,
-    JOB_STATUS_QUARANTINED,
-    JOB_STATUS_RUNNING,
-    JOB_STATUS_WAITING_FOR_HUMAN,
-    JOB_STATUS_WAITING_FOR_PARALLEL,
-    JOB_STATUS_WAITING_FOR_WORKER,
-    TASK_STATUS_CANCELLED,
-    TASK_STATUS_FAILURE,
-    TASK_STATUS_SUCCESS,
-)
 from .dispatcher import Dispatcher
 from .executor import JobExecutor
 from .health_checker import HealthChecker
@@ -39,7 +22,6 @@ from .logging_config import setup_logging
 from .quota import quota_middleware_factory
 from .ratelimit import rate_limit_middleware_factory
 from .reputation import ReputationCalculator
-from .scheduler import Scheduler
 from .security import client_auth_middleware_factory, worker_auth_middleware_factory
 from .storage.base import StorageBackend
 from .telemetry import setup_telemetry
@@ -55,29 +37,20 @@ EXECUTOR_KEY = AppKey("executor", JobExecutor)
 WATCHER_KEY = AppKey("watcher", Watcher)
 REPUTATION_CALCULATOR_KEY = AppKey("reputation_calculator", ReputationCalculator)
 HEALTH_CHECKER_KEY = AppKey("health_checker", HealthChecker)
-SCHEDULER_KEY = AppKey("scheduler", Scheduler)
-
 EXECUTOR_TASK_KEY = AppKey("executor_task", Task)
 WATCHER_TASK_KEY = AppKey("watcher_task", Task)
 REPUTATION_CALCULATOR_TASK_KEY = AppKey("reputation_calculator_task", Task)
 HEALTH_CHECKER_TASK_KEY = AppKey("health_checker_task", Task)
-SCHEDULER_TASK_KEY = AppKey("scheduler_task", Task)
+
 
 metrics.init_metrics()
+
 
 logger = getLogger(__name__)
 
 
-def json_dumps(obj: Any) -> str:
-    return dumps(obj).decode("utf-8")
-
-
-def json_response(data: Any, **kwargs: Any) -> web.Response:
-    return web.json_response(data, dumps=json_dumps, **kwargs)
-
-
 async def status_handler(_request: web.Request) -> web.Response:
-    return json_response({"status": "ok"})
+    return web.json_response({"status": "ok"})
 
 
 async def metrics_handler(_request: web.Request) -> web.Response:
@@ -86,11 +59,11 @@ async def metrics_handler(_request: web.Request) -> web.Response:
 
 class OrchestratorEngine:
     def __init__(self, storage: StorageBackend, config: Config):
-        setup_logging(config.LOG_LEVEL, config.LOG_FORMAT, config.TZ)
+        setup_logging(config.LOG_LEVEL, config.LOG_FORMAT)
         setup_telemetry()
         self.storage = storage
         self.config = config
-        self.blueprints: dict[str, StateMachineBlueprint] = {}
+        self.blueprints: Dict[str, StateMachineBlueprint] = {}
         self.history_storage: HistoryStorageBase = NoOpHistoryStorage()
         self.ws_manager = WebSocketManager()
         self.app = web.Application(middlewares=[compression_middleware])
@@ -135,7 +108,7 @@ class OrchestratorEngine:
                 storage_class = module.SQLiteHistoryStorage
                 parsed_uri = urlparse(uri)
                 db_path = parsed_uri.path
-                storage_args = [db_path, self.config.TZ]
+                storage_args = [db_path]
             except ImportError as e:
                 logger.error(f"Could not import SQLiteHistoryStorage, perhaps aiosqlite is not installed? Error: {e}")
                 self.history_storage = NoOpHistoryStorage()
@@ -145,7 +118,7 @@ class OrchestratorEngine:
             try:
                 module = import_module(".history.postgres", package="avtomatika")
                 storage_class = module.PostgresHistoryStorage
-                storage_args = [uri, self.config.TZ]
+                storage_args = [uri]
             except ImportError as e:
                 logger.error(f"Could not import PostgresHistoryStorage, perhaps asyncpg is not installed? Error: {e}")
                 self.history_storage = NoOpHistoryStorage()
@@ -219,13 +192,11 @@ class OrchestratorEngine:
         app[WATCHER_KEY] = Watcher(self)
         app[REPUTATION_CALCULATOR_KEY] = ReputationCalculator(self)
         app[HEALTH_CHECKER_KEY] = HealthChecker(self)
-        app[SCHEDULER_KEY] = Scheduler(self)
 
         app[EXECUTOR_TASK_KEY] = create_task(app[EXECUTOR_KEY].run())
         app[WATCHER_TASK_KEY] = create_task(app[WATCHER_KEY].run())
         app[REPUTATION_CALCULATOR_TASK_KEY] = create_task(app[REPUTATION_CALCULATOR_KEY].run())
         app[HEALTH_CHECKER_TASK_KEY] = create_task(app[HEALTH_CHECKER_KEY].run())
-        app[SCHEDULER_TASK_KEY] = create_task(app[SCHEDULER_KEY].run())
 
     async def on_shutdown(self, app: web.Application):
         logger.info("Shutdown sequence started.")
@@ -233,7 +204,6 @@ class OrchestratorEngine:
         app[WATCHER_KEY].stop()
         app[REPUTATION_CALCULATOR_KEY].stop()
         app[HEALTH_CHECKER_KEY].stop()
-        app[SCHEDULER_KEY].stop()
         logger.info("Background task running flags set to False.")
 
         if hasattr(self.history_storage, "close"):
@@ -249,8 +219,6 @@ class OrchestratorEngine:
         app[WATCHER_TASK_KEY].cancel()
         app[REPUTATION_CALCULATOR_TASK_KEY].cancel()
         app[EXECUTOR_TASK_KEY].cancel()
-        # Scheduler task manages its own loop cancellation in stop(), but just in case:
-        app[SCHEDULER_TASK_KEY].cancel()
         logger.info("Background tasks cancelled.")
 
         logger.info("Gathering background tasks with a 10s timeout...")
@@ -261,7 +229,6 @@ class OrchestratorEngine:
                     app[WATCHER_TASK_KEY],
                     app[REPUTATION_CALCULATOR_TASK_KEY],
                     app[EXECUTOR_TASK_KEY],
-                    app[SCHEDULER_TASK_KEY],
                     return_exceptions=True,
                 ),
                 timeout=10.0,
@@ -275,61 +242,12 @@ class OrchestratorEngine:
         logger.info("HTTP session closed.")
         logger.info("Shutdown sequence finished.")
 
-    async def create_background_job(
-        self,
-        blueprint_name: str,
-        initial_data: dict[str, Any],
-        source: str = "internal",
-    ) -> str:
-        """Creates a job directly, bypassing the HTTP API layer.
-        Useful for internal schedulers and triggers.
-        """
-        blueprint = self.blueprints.get(blueprint_name)
-        if not blueprint:
-            raise ValueError(f"Blueprint '{blueprint_name}' not found.")
-
-        job_id = str(uuid4())
-        # Use a special internal client config
-        client_config = {
-            "token": "internal-scheduler",
-            "plan": "system",
-            "params": {"source": source},
-        }
-
-        job_state = {
-            "id": job_id,
-            "blueprint_name": blueprint.name,
-            "current_state": blueprint.start_state,
-            "initial_data": initial_data,
-            "state_history": {},
-            "status": JOB_STATUS_PENDING,
-            "tracing_context": {},
-            "client_config": client_config,
-        }
-        await self.storage.save_job_state(job_id, job_state)
-        await self.storage.enqueue_job(job_id)
-        metrics.jobs_total.inc({metrics.LABEL_BLUEPRINT: blueprint.name})
-
-        # Log the creation in history as well (so we can track scheduled jobs)
-        await self.history_storage.log_job_event(
-            {
-                "job_id": job_id,
-                "state": "pending",
-                "event_type": "job_created",
-                "context_snapshot": job_state,
-                "metadata": {"source": source, "scheduled": True},
-            }
-        )
-
-        logger.info(f"Created background job {job_id} for blueprint '{blueprint_name}' (source: {source})")
-        return job_id
-
     def _create_job_handler(self, blueprint: StateMachineBlueprint) -> Callable:
         async def handler(request: web.Request) -> web.Response:
             try:
-                initial_data = await request.json(loads=loads)
+                initial_data = await request.json()
             except Exception:
-                return json_response({"error": "Invalid JSON body"}, status=400)
+                return web.json_response({"error": "Invalid JSON body"}, status=400)
 
             client_config = request["client_config"]
             carrier = {str(k): v for k, v in request.headers.items()}
@@ -341,44 +259,44 @@ class OrchestratorEngine:
                 "current_state": blueprint.start_state,
                 "initial_data": initial_data,
                 "state_history": {},
-                "status": JOB_STATUS_PENDING,
+                "status": "pending",
                 "tracing_context": carrier,
                 "client_config": client_config,
             }
             await self.storage.save_job_state(job_id, job_state)
             await self.storage.enqueue_job(job_id)
             metrics.jobs_total.inc({metrics.LABEL_BLUEPRINT: blueprint.name})
-            return json_response({"status": "accepted", "job_id": job_id}, status=202)
+            return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 
         return handler
 
     async def _get_job_status_handler(self, request: web.Request) -> web.Response:
         job_id = request.match_info.get("job_id")
         if not job_id:
-            return json_response({"error": "job_id is required in path"}, status=400)
+            return web.json_response({"error": "job_id is required in path"}, status=400)
         job_state = await self.storage.get_job_state(job_id)
         if not job_state:
-            return json_response({"error": "Job not found"}, status=404)
-        return json_response(job_state, status=200)
+            return web.json_response({"error": "Job not found"}, status=404)
+        return web.json_response(job_state, status=200)
 
     async def _cancel_job_handler(self, request: web.Request) -> web.Response:
         job_id = request.match_info.get("job_id")
         if not job_id:
-            return json_response({"error": "job_id is required in path"}, status=400)
+            return web.json_response({"error": "job_id is required in path"}, status=400)
 
         job_state = await self.storage.get_job_state(job_id)
         if not job_state:
-            return json_response({"error": "Job not found"}, status=404)
+            return web.json_response({"error": "Job not found"}, status=404)
 
-        if job_state.get("status") != JOB_STATUS_WAITING_FOR_WORKER:
-            return json_response(
+        if job_state.get("status") != "waiting_for_worker":
+            return web.json_response(
                 {"error": "Job is not in a state that can be cancelled (must be waiting for a worker)."},
                 status=409,
             )
 
         worker_id = job_state.get("task_worker_id")
         if not worker_id:
-            return json_response(
+            return web.json_response(
                 {"error": "Cannot cancel job: worker_id not found in job state."},
                 status=500,
             )
@@ -386,7 +304,7 @@ class OrchestratorEngine:
         worker_info = await self.storage.get_worker_info(worker_id)
         task_id = job_state.get("current_task_id")
         if not task_id:
-            return json_response(
+            return web.json_response(
                 {"error": "Cannot cancel job: task_id not found in job state."},
                 status=500,
             )
@@ -399,28 +317,28 @@ class OrchestratorEngine:
             command = {"command": "cancel_task", "task_id": task_id, "job_id": job_id}
             sent = await self.ws_manager.send_command(worker_id, command)
             if sent:
-                return json_response({"status": "cancellation_request_sent"})
+                return web.json_response({"status": "cancellation_request_sent"})
             else:
                 logger.warning(f"Failed to send WebSocket cancellation for task {task_id}, but Redis flag is set.")
                 # Proceed to return success, as the Redis flag will handle it
 
-        return json_response({"status": "cancellation_request_accepted"})
+        return web.json_response({"status": "cancellation_request_accepted"})
 
     async def _get_job_history_handler(self, request: web.Request) -> web.Response:
         job_id = request.match_info.get("job_id")
         if not job_id:
-            return json_response({"error": "job_id is required in path"}, status=400)
+            return web.json_response({"error": "job_id is required in path"}, status=400)
         history = await self.history_storage.get_job_history(job_id)
-        return json_response(history)
+        return web.json_response(history)
 
     async def _get_blueprint_graph_handler(self, request: web.Request) -> web.Response:
         blueprint_name = request.match_info.get("blueprint_name")
         if not blueprint_name:
-            return json_response({"error": "blueprint_name is required in path"}, status=400)
+            return web.json_response({"error": "blueprint_name is required in path"}, status=400)
 
         blueprint = self.blueprints.get(blueprint_name)
         if not blueprint:
-            return json_response({"error": "Blueprint not found"}, status=404)
+            return web.json_response({"error": "Blueprint not found"}, status=404)
 
         try:
             graph_dot = blueprint.render_graph()
@@ -428,21 +346,21 @@ class OrchestratorEngine:
         except FileNotFoundError:
             error_msg = "Graphviz is not installed on the server. Cannot generate graph."
             logger.error(error_msg)
-            return json_response({"error": error_msg}, status=501)
+            return web.json_response({"error": error_msg}, status=501)
 
     async def _get_workers_handler(self, request: web.Request) -> web.Response:
         workers = await self.storage.get_available_workers()
-        return json_response(workers)
+        return web.json_response(workers)
 
     async def _get_jobs_handler(self, request: web.Request) -> web.Response:
         try:
             limit = int(request.query.get("limit", "100"))
             offset = int(request.query.get("offset", "0"))
         except ValueError:
-            return json_response({"error": "Invalid limit/offset parameter"}, status=400)
+            return web.json_response({"error": "Invalid limit/offset parameter"}, status=400)
 
         jobs = await self.history_storage.get_jobs(limit=limit, offset=offset)
-        return json_response(jobs)
+        return web.json_response(jobs)
 
     async def _get_dashboard_handler(self, request: web.Request) -> web.Response:
         worker_count = await self.storage.get_active_worker_count()
@@ -453,7 +371,7 @@ class OrchestratorEngine:
             "workers": {"total": worker_count},
             "jobs": {"queued": queue_length, **job_summary},
         }
-        return json_response(dashboard_data)
+        return web.json_response(dashboard_data)
 
     async def _task_result_handler(self, request: web.Request) -> web.Response:
         import logging
@@ -462,14 +380,14 @@ class OrchestratorEngine:
         data = request.get("task_result_data")
         if data is None:
             try:
-                data = await request.json(loads=loads)
+                data = await request.json()
             except Exception:
-                return json_response({"error": "Invalid JSON body"}, status=400)
+                return web.json_response({"error": "Invalid JSON body"}, status=400)
 
         job_id = data.get("job_id")
         task_id = data.get("task_id")
         result = data.get("result", {})
-        result_status = result.get("status", TASK_STATUS_SUCCESS)
+        result_status = result.get("status", "success")
         error_message = result.get("error")
         payload_worker_id = data.get("worker_id")
 
@@ -477,10 +395,10 @@ class OrchestratorEngine:
         authenticated_worker_id = request.get("worker_id")
         if not authenticated_worker_id:
             # This should not happen if the auth middleware is working correctly
-            return json_response({"error": "Could not identify authenticated worker."}, status=500)
+            return web.json_response({"error": "Could not identify authenticated worker."}, status=500)
 
         if payload_worker_id and payload_worker_id != authenticated_worker_id:
-            return json_response(
+            return web.json_response(
                 {
                     "error": f"Forbidden: Authenticated worker '{authenticated_worker_id}' "
                     f"cannot submit results for another worker '{payload_worker_id}'.",
@@ -489,21 +407,21 @@ class OrchestratorEngine:
             )
 
         if not job_id or not task_id:
-            return json_response({"error": "job_id and task_id are required"}, status=400)
+            return web.json_response({"error": "job_id and task_id are required"}, status=400)
 
         job_state = await self.storage.get_job_state(job_id)
         if not job_state:
-            return json_response({"error": "Job not found"}, status=404)
+            return web.json_response({"error": "Job not found"}, status=404)
 
         # Handle parallel task completion
-        if job_state.get("status") == JOB_STATUS_WAITING_FOR_PARALLEL:
+        if job_state.get("status") == "waiting_for_parallel_tasks":
             await self.storage.remove_job_from_watch(f"{job_id}:{task_id}")
             job_state.setdefault("aggregation_results", {})[task_id] = result
             job_state.setdefault("active_branches", []).remove(task_id)
 
             if not job_state["active_branches"]:
                 logger.info(f"All parallel branches for job {job_id} have completed.")
-                job_state["status"] = JOB_STATUS_RUNNING
+                job_state["status"] = "running"
                 job_state["current_state"] = job_state["aggregation_target"]
                 await self.storage.save_job_state(job_id, job_state)
                 await self.storage.enqueue_job(job_id)
@@ -514,7 +432,7 @@ class OrchestratorEngine:
                 )
                 await self.storage.save_job_state(job_id, job_state)
 
-            return json_response({"status": "parallel_branch_result_accepted"}, status=200)
+            return web.json_response({"status": "parallel_branch_result_accepted"}, status=200)
 
         await self.storage.remove_job_from_watch(job_id)
 
@@ -537,13 +455,13 @@ class OrchestratorEngine:
 
         job_state["tracing_context"] = {str(k): v for k, v in request.headers.items()}
 
-        if result_status == TASK_STATUS_FAILURE:
+        if result_status == "failure":
             error_details = result.get("error", {})
-            error_type = ERROR_CODE_TRANSIENT
+            error_type = "TRANSIENT_ERROR"
             error_message = "No error details provided."
 
             if isinstance(error_details, dict):
-                error_type = error_details.get("code", ERROR_CODE_TRANSIENT)
+                error_type = error_details.get("code", "TRANSIENT_ERROR")
                 error_message = error_details.get("message", "No error message provided.")
             elif isinstance(error_details, str):
                 # Fallback for old format where `error` was just a string
@@ -551,32 +469,32 @@ class OrchestratorEngine:
 
             logging.warning(f"Task {task_id} for job {job_id} failed with error type '{error_type}'.")
 
-            if error_type == ERROR_CODE_PERMANENT:
-                job_state["status"] = JOB_STATUS_QUARANTINED
+            if error_type == "PERMANENT_ERROR":
+                job_state["status"] = "quarantined"
                 job_state["error_message"] = f"Task failed with permanent error: {error_message}"
                 await self.storage.save_job_state(job_id, job_state)
                 await self.storage.quarantine_job(job_id)
-            elif error_type == ERROR_CODE_INVALID_INPUT:
-                job_state["status"] = JOB_STATUS_FAILED
+            elif error_type == "INVALID_INPUT_ERROR":
+                job_state["status"] = "failed"
                 job_state["error_message"] = f"Task failed due to invalid input: {error_message}"
                 await self.storage.save_job_state(job_id, job_state)
             else:  # TRANSIENT_ERROR or any other/unspecified error
                 await self._handle_task_failure(job_state, task_id, error_message)
 
-            return json_response({"status": "result_accepted_failure"}, status=200)
+            return web.json_response({"status": "result_accepted_failure"}, status=200)
 
-        if result_status == TASK_STATUS_CANCELLED:
+        if result_status == "cancelled":
             logging.info(f"Task {task_id} for job {job_id} was cancelled by worker.")
-            job_state["status"] = JOB_STATUS_CANCELLED
+            job_state["status"] = "cancelled"
             await self.storage.save_job_state(job_id, job_state)
             # Optionally, trigger a specific 'cancelled' transition if defined in the blueprint
             transitions = job_state.get("current_task_transitions", {})
             if next_state := transitions.get("cancelled"):
                 job_state["current_state"] = next_state
-                job_state["status"] = JOB_STATUS_RUNNING  # It's running the cancellation handler now
+                job_state["status"] = "running"  # It's running the cancellation handler now
                 await self.storage.save_job_state(job_id, job_state)
                 await self.storage.enqueue_job(job_id)
-            return json_response({"status": "result_accepted_cancelled"}, status=200)
+            return web.json_response({"status": "result_accepted_cancelled"}, status=200)
 
         transitions = job_state.get("current_task_transitions", {})
         if next_state := transitions.get(result_status):
@@ -589,16 +507,16 @@ class OrchestratorEngine:
                 job_state["state_history"].update(worker_data)
 
             job_state["current_state"] = next_state
-            job_state["status"] = JOB_STATUS_RUNNING
+            job_state["status"] = "running"
             await self.storage.save_job_state(job_id, job_state)
             await self.storage.enqueue_job(job_id)
         else:
             logging.error(f"Job {job_id} failed. Worker returned unhandled status '{result_status}'.")
-            job_state["status"] = JOB_STATUS_FAILED
+            job_state["status"] = "failed"
             job_state["error_message"] = f"Worker returned unhandled status: {result_status}"
             await self.storage.save_job_state(job_id, job_state)
 
-        return json_response({"status": "result_accepted_success"}, status=200)
+        return web.json_response({"status": "result_accepted_success"}, status=200)
 
     async def _handle_task_failure(self, job_state: dict, task_id: str, error_message: str | None):
         import logging
@@ -614,7 +532,7 @@ class OrchestratorEngine:
             task_info = job_state.get("current_task_info")
             if not task_info:
                 logging.error(f"Cannot retry job {job_id}: missing 'current_task_info' in job state.")
-                job_state["status"] = JOB_STATUS_FAILED
+                job_state["status"] = "failed"
                 job_state["error_message"] = "Cannot retry: original task info not found."
                 await self.storage.save_job_state(job_id, job_state)
                 return
@@ -623,7 +541,7 @@ class OrchestratorEngine:
             timeout_seconds = task_info.get("timeout_seconds", self.config.WORKER_TIMEOUT_SECONDS)
             timeout_at = now + timeout_seconds
 
-            job_state["status"] = JOB_STATUS_WAITING_FOR_WORKER
+            job_state["status"] = "waiting_for_worker"
             job_state["task_dispatched_at"] = now
             await self.storage.save_job_state(job_id, job_state)
             await self.storage.add_job_to_watch(job_id, timeout_at)
@@ -631,7 +549,7 @@ class OrchestratorEngine:
             await self.dispatcher.dispatch(job_state, task_info)
         else:
             logging.critical(f"Job {job_id} has failed {max_retries + 1} times. Moving to quarantine.")
-            job_state["status"] = JOB_STATUS_QUARANTINED
+            job_state["status"] = "quarantined"
             job_state["error_message"] = f"Task failed after {max_retries + 1} attempts: {error_message}"
             await self.storage.save_job_state(job_id, job_state)
             await self.storage.quarantine_job(job_id)
@@ -639,97 +557,62 @@ class OrchestratorEngine:
     async def _human_approval_webhook_handler(self, request: web.Request) -> web.Response:
         job_id = request.match_info.get("job_id")
         if not job_id:
-            return json_response({"error": "job_id is required in path"}, status=400)
+            return web.json_response({"error": "job_id is required in path"}, status=400)
         try:
-            data = await request.json(loads=loads)
+            data = await request.json()
             decision = data.get("decision")
             if not decision:
-                return json_response({"error": "decision is required in body"}, status=400)
+                return web.json_response({"error": "decision is required in body"}, status=400)
         except Exception:
-            return json_response({"error": "Invalid JSON body"}, status=400)
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
         job_state = await self.storage.get_job_state(job_id)
         if not job_state:
-            return json_response({"error": "Job not found"}, status=404)
-        if job_state.get("status") not in [JOB_STATUS_WAITING_FOR_WORKER, JOB_STATUS_WAITING_FOR_HUMAN]:
-            return json_response({"error": "Job is not in a state that can be approved"}, status=409)
+            return web.json_response({"error": "Job not found"}, status=404)
+        if job_state.get("status") not in ["waiting_for_worker", "waiting_for_human"]:
+            return web.json_response({"error": "Job is not in a state that can be approved"}, status=409)
         transitions = job_state.get("current_task_transitions", {})
         next_state = transitions.get(decision)
         if not next_state:
-            return json_response({"error": f"Invalid decision '{decision}' for this job"}, status=400)
+            return web.json_response({"error": f"Invalid decision '{decision}' for this job"}, status=400)
         job_state["current_state"] = next_state
-        job_state["status"] = JOB_STATUS_RUNNING
+        job_state["status"] = "running"
         await self.storage.save_job_state(job_id, job_state)
         await self.storage.enqueue_job(job_id)
-        return json_response({"status": "approval_received", "job_id": job_id})
+        return web.json_response({"status": "approval_received", "job_id": job_id})
 
     async def _get_quarantined_jobs_handler(self, request: web.Request) -> web.Response:
         """Returns a list of all job IDs in the quarantine queue."""
         jobs = await self.storage.get_quarantined_jobs()
-        return json_response(jobs)
+        return web.json_response(jobs)
 
     async def _reload_worker_configs_handler(self, request: web.Request) -> web.Response:
         """Handles the dynamic reloading of worker configurations."""
         logger.info("Received request to reload worker configurations.")
         if not self.config.WORKERS_CONFIG_PATH:
-            return json_response(
+            return web.json_response(
                 {"error": "WORKERS_CONFIG_PATH is not set, cannot reload configs."},
                 status=400,
             )
 
         await load_worker_configs_to_redis(self.storage, self.config.WORKERS_CONFIG_PATH)
-        return json_response({"status": "worker_configs_reloaded"})
+        return web.json_response({"status": "worker_configs_reloaded"})
 
     async def _flush_db_handler(self, request: web.Request) -> web.Response:
         logger.warning("Received request to flush the database.")
         await self.storage.flush_all()
         await load_client_configs_to_redis(self.storage)
-        return json_response({"status": "db_flushed"}, status=200)
+        return web.json_response({"status": "db_flushed"}, status=200)
 
-    async def _docs_handler(self, request: web.Request) -> web.Response:
+    @staticmethod
+    async def _docs_handler(request: web.Request) -> web.Response:
         from importlib import resources
 
         try:
             content = resources.read_text("avtomatika", "api.html")
+            return web.Response(text=content, content_type="text/html")
         except FileNotFoundError:
             logger.error("api.html not found within the avtomatika package.")
-            return json_response({"error": "Documentation file not found on server."}, status=500)
-
-        # Generate dynamic documentation for registered blueprints
-        blueprint_endpoints = []
-        for bp in self.blueprints.values():
-            if not bp.api_endpoint:
-                continue
-
-            version_prefix = f"/{bp.api_version}" if bp.api_version else ""
-            endpoint_path = bp.api_endpoint if bp.api_endpoint.startswith("/") else f"/{bp.api_endpoint}"
-            full_path = f"/api{version_prefix}{endpoint_path}"
-
-            blueprint_endpoints.append(
-                {
-                    "id": f"post-create-{bp.name.replace('_', '-')}",
-                    "name": f"Create {bp.name.replace('_', ' ').title()} Job",
-                    "method": "POST",
-                    "path": full_path,
-                    "description": f"Creates and starts a new instance (Job) of the `{bp.name}` blueprint.",
-                    "request": {"body": {"initial_data": {}}},
-                    "responses": [
-                        {
-                            "code": "202 Accepted",
-                            "description": "Job successfully accepted for processing.",
-                            "body": {"status": "accepted", "job_id": "..."},
-                        }
-                    ],
-                }
-            )
-
-        # Inject dynamic endpoints into the apiData structure in the HTML
-        if blueprint_endpoints:
-            endpoints_json = dumps(blueprint_endpoints, option=OPT_INDENT_2).decode("utf-8")
-            # We insert the new endpoints at the beginning of the 'Protected API' group
-            marker = "group: 'Protected API',\n                endpoints: ["
-            content = content.replace(marker, f"{marker}\n{endpoints_json.strip('[]')},")
-
-        return web.Response(text=content, content_type="text/html")
+            return web.json_response({"error": "Documentation file not found on server."}, status=500)
 
     def _setup_routes(self):
         public_app = web.Application()
@@ -746,7 +629,7 @@ class OrchestratorEngine:
         api_middlewares = [auth_middleware, quota_middleware]
 
         protected_app = web.Application(middlewares=api_middlewares)
-        versioned_apps: dict[str, web.Application] = {}
+        versioned_apps: Dict[str, web.Application] = {}
         has_unversioned_routes = False
 
         for bp in self.blueprints.values():
@@ -824,14 +707,14 @@ class OrchestratorEngine:
     async def _handle_get_next_task(self, request: web.Request) -> web.Response:
         worker_id = request.match_info.get("worker_id")
         if not worker_id:
-            return json_response({"error": "worker_id is required in path"}, status=400)
+            return web.json_response({"error": "worker_id is required in path"}, status=400)
 
         logger.debug(f"Worker {worker_id} is requesting a new task.")
         task = await self.storage.dequeue_task_for_worker(worker_id, self.config.WORKER_POLL_TIMEOUT_SECONDS)
 
         if task:
             logger.info(f"Sending task {task.get('task_id')} to worker {worker_id}")
-            return json_response(task, status=200)
+            return web.json_response(task, status=200)
         logger.debug(f"No tasks for worker {worker_id}, responding 204.")
         return web.Response(status=204)
 
@@ -844,7 +727,7 @@ class OrchestratorEngine:
         """
         worker_id = request.match_info.get("worker_id")
         if not worker_id:
-            return json_response({"error": "worker_id is required in path"}, status=400)
+            return web.json_response({"error": "worker_id is required in path"}, status=400)
 
         ttl = self.config.WORKER_HEALTH_CHECK_INTERVAL_SECONDS * 2
         update_data = None
@@ -852,8 +735,11 @@ class OrchestratorEngine:
         # Check for body content without consuming it if it's not JSON
         if request.can_read_body:
             try:
-                update_data = await request.json(loads=loads)
+                update_data = await request.json()
             except Exception:
+                # This can happen if the body is present but not valid JSON.
+                # We can treat it as a lightweight heartbeat or return an error.
+                # For robustness, let's treat it as a lightweight ping but log a warning.
                 logger.warning(
                     f"Received PATCH from worker {worker_id} with non-JSON body. Treating as TTL-only heartbeat."
                 )
@@ -862,7 +748,7 @@ class OrchestratorEngine:
             # Full update path
             updated_worker = await self.storage.update_worker_status(worker_id, update_data, ttl)
             if not updated_worker:
-                return json_response({"error": "Worker not found"}, status=404)
+                return web.json_response({"error": "Worker not found"}, status=404)
 
             await self.history_storage.log_worker_event(
                 {
@@ -871,25 +757,25 @@ class OrchestratorEngine:
                     "worker_info_snapshot": updated_worker,
                 },
             )
-            return json_response(updated_worker, status=200)
+            return web.json_response(updated_worker, status=200)
         else:
             # Lightweight TTL-only heartbeat path
             refreshed = await self.storage.refresh_worker_ttl(worker_id, ttl)
             if not refreshed:
-                return json_response({"error": "Worker not found"}, status=404)
-            return json_response({"status": "ttl_refreshed"})
+                return web.json_response({"error": "Worker not found"}, status=404)
+            return web.json_response({"status": "ttl_refreshed"})
 
     async def _register_worker_handler(self, request: web.Request) -> web.Response:
         # The worker_registration_data is attached by the auth middleware
         # to avoid reading the request body twice.
         worker_data = request.get("worker_registration_data")
         if not worker_data:
-            return json_response({"error": "Worker data not found in request"}, status=500)
+            return web.json_response({"error": "Worker data not found in request"}, status=500)
 
         worker_id = worker_data.get("worker_id")
         # This check is redundant if the middleware works, but good for safety
         if not worker_id:
-            return json_response({"error": "Missing required field: worker_id"}, status=400)
+            return web.json_response({"error": "Missing required field: worker_id"}, status=400)
 
         ttl = self.config.WORKER_HEALTH_CHECK_INTERVAL_SECONDS * 2
         await self.storage.register_worker(worker_id, worker_data, ttl)
@@ -905,7 +791,7 @@ class OrchestratorEngine:
                 "worker_info_snapshot": worker_data,
             },
         )
-        return json_response({"status": "registered"}, status=200)
+        return web.json_response({"status": "registered"}, status=200)
 
     def run(self):
         self.setup()

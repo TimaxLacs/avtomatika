@@ -1,75 +1,80 @@
-"""
-Минимальный Worker для локального тестирования.
-Запуск: python local_test/worker_client.py
-"""
+"""Минимальный клиент воркера для локального тестирования."""
+
 import asyncio
 import os
+import sys
+import uuid
 
-# Устанавливаем переменные окружения ДО импорта Worker
-os.environ["ORCHESTRATOR_URL"] = "http://localhost:8080"
-os.environ["WORKER_ID"] = "local-test-worker"
+# Добавляем путь к src для импорта
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "avtomatika_worker", "src"))
+
+# Устанавливаем переменные окружения ПЕРЕД импортом Worker
+os.environ["ORCHESTRATOR_URL"] = "http://localhost:8000"
+os.environ["WORKER_ID"] = f"test-worker-{uuid.uuid4().hex[:8]}"
 os.environ["WORKER_TOKEN"] = "test-worker-token"
+
+print("Environment set up:")
+print(f"  ORCHESTRATOR_URL: {os.environ['ORCHESTRATOR_URL']}")
+print(f"  WORKER_ID: {os.environ['WORKER_ID']}")
+print(f"  WORKER_TOKEN: {os.environ['WORKER_TOKEN']}")
 
 from avtomatika_worker import Worker
 
-# === Worker ===
+# Создаём воркер
+print("\nCreating worker...")
 worker = Worker(
-    worker_type="test-worker",
+    worker_type="test-processor",
     max_concurrent_tasks=5,
 )
+print("Worker created!")
 
 
-@worker.task("echo_task")
-async def echo_task_handler(params, task_id, job_id, **kwargs):
-    """
-    Простая задача: получает сообщение и число,
-    возвращает сообщение повторённое N раз.
-    """
-    print(f"\n{'='*50}")
-    print(f"[WORKER] Received task {task_id}")
-    print(f"[WORKER] Job ID: {job_id}")
-    print(f"[WORKER] Params: {params}")
-    print(f"{'='*50}")
-
-    message = params.get("message", "default")
-    multiply = params.get("multiply", 1)
-
-    # Имитируем работу
-    print(f"[WORKER] Processing...")
-    await asyncio.sleep(1)
-
-    result_message = (message + " ") * multiply
-
-    print(f"[WORKER] Done! Result: {result_message.strip()}")
-    print(f"{'='*50}\n")
-
+@worker.task("process_data")
+async def process_data_handler(params: dict, **kwargs) -> dict:
+    """Обработчик тестовой задачи."""
+    job_id = params.get("job_id", "unknown")
+    payload = params.get("payload", "")
+    
+    print(f"[Task] Processing data for job {job_id}")
+    print(f"[Task] Payload: {payload}")
+    
+    # Симулируем работу
+    await asyncio.sleep(2)
+    
+    # Возвращаем результат
+    result = {
+        "processed_payload": payload.upper() if isinstance(payload, str) else payload,
+        "worker_id": os.environ.get("WORKER_ID"),
+        "message": "Data processed successfully!",
+    }
+    
+    print(f"[Task] Completed processing for job {job_id}")
+    
     return {
         "status": "success",
-        "data": {
-            "processed_message": result_message.strip(),
-            "original_message": message,
-            "multiplied_by": multiply,
-        },
+        "data": result,
     }
 
 
-@worker.task("failing_task")
-async def failing_task_handler(params, **kwargs):
-    """Задача, которая всегда падает (для тестирования ошибок)."""
-    print("[WORKER] This task will fail!")
-    return {
-        "status": "failure",
-        "error": {"code": "TRANSIENT_ERROR", "message": "Intentional failure for testing"},
-    }
+async def main():
+    """Запуск воркера."""
+    print("=" * 50)
+    print(f"Starting worker: {os.environ['WORKER_ID']}")
+    print(f"Orchestrator URL: {os.environ['ORCHESTRATOR_URL']}")
+    print("=" * 50)
+    print()
+    print("Registered task handlers:")
+    print("  - process_data")
+    print()
+    print("Press Ctrl+C to stop")
+    print("=" * 50)
+    
+    sys.stdout.flush()
+    await worker.main()
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("WORKER STARTING...")
-    print("=" * 60)
-    print(f"\nWorker ID: {os.environ['WORKER_ID']}")
-    print(f"Orchestrator: {os.environ['ORCHESTRATOR_URL']}")
-    print(f"Supported tasks: echo_task, failing_task")
-    print("=" * 60 + "\n")
-
-    worker.run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nStopped by user")

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avtomatika-bot-cli"
+version = "1.0.0a1"
+description = "CLI client for managing bots via Avtomatika Bot Runner"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Avtomatika Team"}
+]
+keywords = ["telegram", "bot", "cli", "avtomatika"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+]
+
+dependencies = [
+    "requests>=2.28.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+avtomatika-bot = "avtomatika_bot_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]

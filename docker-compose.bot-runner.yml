@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # Redis для хранения состояний
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Оркестратор Avtomatika
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CLIENT_TOKEN=test-client-token
+      - GLOBAL_WORKER_TOKEN=test-worker-token
+      - RATE_LIMITING_ENABLED=false
+      - LOG_LEVEL=INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/_public/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Bot Runner Worker
+  bot-runner-worker:
+    build:
+      context: ./bot_runner_worker
+      dockerfile: Dockerfile
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - WORKER_TOKEN=test-worker-token
+      - WORKER_ID=bot-runner-1
+      - WORKER_TYPE=bot-runner
+      - MAX_BOTS_PER_USER=3
+      - DOCKER_NETWORK=avtomatika_bot_runner_network
+    volumes:
+      # Доступ к Docker socket для управления контейнерами
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    networks:
+      - default
+      - bot_runner_network
+
+networks:
+  default:
+    driver: bridge
+  bot_runner_network:
+    name: avtomatika_bot_runner_network
+    driver: bridge
+
+volumes:
+  redis_data:

@@ -146,6 +146,14 @@ class StateMachineBlueprint:
     def handler_for(self, state: str, is_start: bool = False, is_end: bool = False) -> HandlerDecorator:
         return HandlerDecorator(self, state, is_start=is_start, is_end=is_end)
 
+    def state(self, state_name: str, is_start: bool = False, is_end: bool = False) -> HandlerDecorator:
+        """Convenient alias for handler_for. Auto-detects start state if state_name is 'init'."""
+        if state_name == "init" and self.start_state is None:
+            is_start = True
+        if state_name in ("completed", "failed"):
+            is_end = True
+        return self.handler_for(state_name, is_start=is_start, is_end=is_end)
+
     def aggregator_for(self, state: str) -> Callable:
         """Decorator for registering an aggregator handler."""
 

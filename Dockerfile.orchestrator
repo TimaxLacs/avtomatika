@@ -1,0 +1,89 @@
+# Dockerfile для Оркестратора с Bot Runner Blueprint
+FROM python:3.11-slim
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем файлы проекта
+COPY pyproject.toml README.md ./
+COPY src/ src/
+
+# Устанавливаем основной пакет с зависимостями
+RUN pip install --no-cache-dir -e ".[redis]"
+
+# Переменные окружения по умолчанию
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/_public/status || exit 1
+
+# Запуск через простой скрипт
+COPY <<'EOF' /app/run_orchestrator.py
+import asyncio
+import os
+from redis.asyncio import Redis
+from avtomatika.engine import OrchestratorEngine
+from avtomatika.config import Config
+from avtomatika.storage.redis import RedisStorage
+from avtomatika.blueprints.bot_runner import blueprint as bot_runner_blueprint
+
+async def main():
+    # Настройка конфигурации
+    config = Config()
+    config.CLIENT_TOKEN = os.getenv("CLIENT_TOKEN", "test-client-token")
+    config.GLOBAL_WORKER_TOKEN = os.getenv("GLOBAL_WORKER_TOKEN", "test-worker-token")
+    config.RATE_LIMITING_ENABLED = os.getenv("RATE_LIMITING_ENABLED", "true").lower() == "true"
+    config.API_HOST = "0.0.0.0"
+    config.API_PORT = int(os.getenv("PORT", 8000))
+    
+    # Создаём Redis клиент
+    # НЕ используем decode_responses=True, т.к. некоторые данные хранятся в сжатом виде
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+    redis_client = Redis(host=redis_host, port=redis_port)
+    
+    # Создаём storage
+    storage = RedisStorage(redis_client)
+    
+    # Регистрируем тестового клиента
+    await storage.save_client_config("test-client-token", {
+        "token": "test-client-token",
+        "name": "test-client",
+        "allowed_blueprints": ["bot_runner"],
+    })
+    await storage.initialize_client_quota("test-client-token", 1000)
+    
+    # Создаём engine
+    engine = OrchestratorEngine(config=config, storage=storage)
+    
+    # Регистрируем blueprint
+    engine.register_blueprint(bot_runner_blueprint)
+    
+    # Запускаем
+    await engine.start()
+    
+    print(f"Orchestrator running on http://0.0.0.0:{config.API_PORT}")
+    print(f"Blueprints: bot_runner")
+    
+    # Ждём завершения
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await engine.stop()
+        await redis_client.aclose()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+EOF
+
+# Запуск
+CMD ["python", "/app/run_orchestrator.py"]
